@@ -1,0 +1,18 @@
+services:
+  postgres:
+    # bookworm variant: Debian 13-based images dropped legacy tz aliases
+    # (e.g. Asia/Calcutta), which Windows JDKs still send at JDBC connect time
+    image: postgres:17-bookworm
+    container_name: auth-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: yourrootpw
+      POSTGRES_DB: auth_platform
+    ports:
+      - "5432:5432"
+    volumes:
+      - auth-postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  auth-postgres-data:
