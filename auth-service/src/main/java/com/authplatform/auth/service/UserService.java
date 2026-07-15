@@ -1,17 +1,22 @@
 package com.authplatform.auth.service;
 
-import com.authplatform.auth.dto.CreateUserRequest;
+import com.authplatform.auth.dto.RegisterRequest;
+import com.authplatform.auth.dto.RegisterResponse;
 import com.authplatform.auth.dto.UserResponse;
 import com.authplatform.auth.entity.User;
-import com.authplatform.auth.exception.DuplicateResourceException;
+import com.authplatform.auth.exception.UserAlreadyExistsException;
 import com.authplatform.auth.exception.UserNotFoundException;
 import com.authplatform.auth.mapper.UserMapper;
 import com.authplatform.auth.repository.UserRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 @Service
 public class UserService {
+
+    private static final Logger log = LoggerFactory.getLogger(UserService.class);
 
     private final UserRepository userRepository;
     private final UserMapper userMapper;
@@ -29,14 +34,17 @@ public class UserService {
     }
 
     @Transactional
-    public UserResponse createUser(CreateUserRequest request) {
-        if (userRepository.existsByUsername(request.username())) {
-            throw new DuplicateResourceException("Username already taken: " + request.username());
-        }
+    public RegisterResponse registerUser(RegisterRequest request) {
+        log.info("Registration attempt for email={}", request.email());
+
         if (userRepository.existsByEmail(request.email())) {
-            throw new DuplicateResourceException("Email already registered: " + request.email());
+            throw new UserAlreadyExistsException(request.email());
         }
-        User saved = userRepository.save(userMapper.toEntity(request));
-        return userMapper.toResponse(saved);
+
+        User user = userMapper.toEntity(request);
+        User saved = userRepository.save(user);
+
+        log.info("User registered successfully id={} email={}", saved.getId(), saved.getEmail());
+        return RegisterResponse.of("Registration Successful");
     }
 }

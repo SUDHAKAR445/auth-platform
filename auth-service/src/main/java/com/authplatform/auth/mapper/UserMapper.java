@@ -1,6 +1,6 @@
 package com.authplatform.auth.mapper;
 
-import com.authplatform.auth.dto.CreateUserRequest;
+import com.authplatform.auth.dto.RegisterRequest;
 import com.authplatform.auth.dto.UserResponse;
 import com.authplatform.auth.entity.User;
 import org.springframework.stereotype.Component;
@@ -8,22 +8,23 @@ import org.springframework.stereotype.Component;
 @Component
 public class UserMapper {
 
-    public User toEntity(CreateUserRequest request) {
+    public User toEntity(RegisterRequest request) {
         return new User(
-                request.username(),
-                request.email(),
                 request.firstName(),
-                request.lastName()
+                request.lastName(),
+                request.email(),
+                request.password()
         );
     }
 
     public UserResponse toResponse(User user) {
         return new UserResponse(
                 user.getId(),
-                user.getUsername(),
-                user.getEmail(),
                 user.getFirstName(),
                 user.getLastName(),
+                user.getEmail(),
+                user.getStatus(),
+                user.isEmailVerified(),
                 user.getCreatedAt(),
                 user.getUpdatedAt()
         );
