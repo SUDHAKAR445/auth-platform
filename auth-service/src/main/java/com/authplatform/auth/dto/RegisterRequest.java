@@ -1,5 +1,6 @@
 package com.authplatform.auth.dto;
 
+import com.authplatform.auth.validation.StrongPassword;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
@@ -20,7 +21,8 @@ public record RegisterRequest(
         String email,
 
         @NotBlank(message = "password is required")
-        @Size(min = 8, max = 255, message = "password must be at least 8 characters")
+        @Size(max = 255, message = "password must not exceed 255 characters")
+        @StrongPassword
         String password
 ) {
 }

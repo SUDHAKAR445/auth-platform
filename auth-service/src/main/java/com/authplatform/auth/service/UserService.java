@@ -10,6 +10,7 @@ import com.authplatform.auth.mapper.UserMapper;
 import com.authplatform.auth.repository.UserRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -20,10 +21,12 @@ public class UserService {
 
     private final UserRepository userRepository;
     private final UserMapper userMapper;
+    private final PasswordEncoder passwordEncoder;
 
-    public UserService(UserRepository userRepository, UserMapper userMapper) {
+    public UserService(UserRepository userRepository, UserMapper userMapper, PasswordEncoder passwordEncoder) {
         this.userRepository = userRepository;
         this.userMapper = userMapper;
+        this.passwordEncoder = passwordEncoder;
     }
 
     @Transactional(readOnly = true)
@@ -42,6 +45,7 @@ public class UserService {
         }
 
         User user = userMapper.toEntity(request);
+        user.setPassword(passwordEncoder.encode(request.password()));
         User saved = userRepository.save(user);
 
         log.info("User registered successfully id={} email={}", saved.getId(), saved.getEmail());
