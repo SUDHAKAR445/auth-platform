@@ -1,11 +1,13 @@
 package com.authplatform.auth.service;
 
+import com.authplatform.auth.config.JwtProperties;
 import com.authplatform.auth.dto.LoginRequest;
 import com.authplatform.auth.dto.LoginResponse;
 import com.authplatform.auth.entity.User;
 import com.authplatform.auth.entity.UserStatus;
 import com.authplatform.auth.exception.InvalidCredentialsException;
 import com.authplatform.auth.repository.UserRepository;
+import com.authplatform.auth.security.JwtService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -13,16 +15,21 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 @Service
-public class LoginService {
+public class AuthenticationService {
 
-    private static final Logger log = LoggerFactory.getLogger(LoginService.class);
+    private static final Logger log = LoggerFactory.getLogger(AuthenticationService.class);
 
     private final UserRepository userRepository;
     private final PasswordEncoder passwordEncoder;
+    private final JwtService jwtService;
+    private final JwtProperties jwtProperties;
 
-    public LoginService(UserRepository userRepository, PasswordEncoder passwordEncoder) {
+    public AuthenticationService(UserRepository userRepository, PasswordEncoder passwordEncoder,
+                                  JwtService jwtService, JwtProperties jwtProperties) {
         this.userRepository = userRepository;
         this.passwordEncoder = passwordEncoder;
+        this.jwtService = jwtService;
+        this.jwtProperties = jwtProperties;
     }
 
     @Transactional(readOnly = true)
@@ -42,7 +49,8 @@ public class LoginService {
             throw new InvalidCredentialsException();
         }
 
+        String token = jwtService.generateToken(user.getEmail());
         log.info("Login successful for email={}", request.email());
-        return LoginResponse.of("Login successful");
+        return new LoginResponse(token, "Bearer", jwtProperties.expiration());
     }
 }

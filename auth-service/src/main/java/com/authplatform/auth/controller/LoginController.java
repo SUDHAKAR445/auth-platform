@@ -2,7 +2,7 @@ package com.authplatform.auth.controller;
 
 import com.authplatform.auth.dto.LoginRequest;
 import com.authplatform.auth.dto.LoginResponse;
-import com.authplatform.auth.service.LoginService;
+import com.authplatform.auth.service.AuthenticationService;
 import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -14,14 +14,14 @@ import org.springframework.web.bind.annotation.RestController;
 @RequestMapping("/api/v1/auth")
 public class LoginController {
 
-    private final LoginService loginService;
+    private final AuthenticationService authenticationService;
 
-    public LoginController(LoginService loginService) {
-        this.loginService = loginService;
+    public LoginController(AuthenticationService authenticationService) {
+        this.authenticationService = authenticationService;
     }
 
     @PostMapping("/login")
     public ResponseEntity<LoginResponse> login(@Valid @RequestBody LoginRequest request) {
-        return ResponseEntity.ok(loginService.login(request));
+        return ResponseEntity.ok(authenticationService.login(request));
     }
 }
