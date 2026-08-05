@@ -10,6 +10,9 @@ public record LoginRequest(
         String email,
 
         @NotBlank(message = "password is required")
-        String password
+        String password,
+
+        // optional — lets a client identify itself so its refresh token is tied to this device
+        String deviceId
 ) {
 }

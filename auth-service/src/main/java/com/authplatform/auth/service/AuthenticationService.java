@@ -3,6 +3,7 @@ package com.authplatform.auth.service;
 import com.authplatform.auth.config.JwtProperties;
 import com.authplatform.auth.dto.LoginRequest;
 import com.authplatform.auth.dto.LoginResponse;
+import com.authplatform.auth.entity.RefreshToken;
 import com.authplatform.auth.entity.User;
 import com.authplatform.auth.entity.UserStatus;
 import com.authplatform.auth.exception.InvalidCredentialsException;
@@ -23,16 +24,19 @@ public class AuthenticationService {
     private final PasswordEncoder passwordEncoder;
     private final JwtService jwtService;
     private final JwtProperties jwtProperties;
+    private final RefreshTokenService refreshTokenService;
 
     public AuthenticationService(UserRepository userRepository, PasswordEncoder passwordEncoder,
-                                  JwtService jwtService, JwtProperties jwtProperties) {
+                                  JwtService jwtService, JwtProperties jwtProperties,
+                                  RefreshTokenService refreshTokenService) {
         this.userRepository = userRepository;
         this.passwordEncoder = passwordEncoder;
         this.jwtService = jwtService;
         this.jwtProperties = jwtProperties;
+        this.refreshTokenService = refreshTokenService;
     }
 
-    @Transactional(readOnly = true)
+    @Transactional
     public LoginResponse login(LoginRequest request) {
         log.info("Login attempt for email={}", request.email());
 
@@ -49,8 +53,10 @@ public class AuthenticationService {
             throw new InvalidCredentialsException();
         }
 
-        String token = jwtService.generateToken(user.getEmail());
+        String accessToken = jwtService.generateToken(user.getEmail());
+        RefreshToken refreshToken = refreshTokenService.generateRefreshToken(user, request.deviceId());
+
         log.info("Login successful for email={}", request.email());
-        return new LoginResponse(token, "Bearer", jwtProperties.expiration());
+        return new LoginResponse(accessToken, "Bearer", refreshToken.getToken(), jwtProperties.expiration());
     }
 }

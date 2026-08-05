@@ -20,4 +20,5 @@ jwt:
   # dev-only secret — move to an environment variable / secrets manager before any real deployment.
   # HS256 requires at least 32 bytes; this is well over that.
   secret: development-only-secret-please-move-to-env-var-before-prod-1234567890
-  expiration: 900 # seconds (15 minutes)
+  expiration: 900 # access token, seconds (15 minutes)
+  refresh-expiration: 604800 # refresh token, seconds (7 days)
