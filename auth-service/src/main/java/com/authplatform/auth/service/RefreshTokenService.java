@@ -4,6 +4,7 @@ import com.authplatform.auth.config.JwtProperties;
 import com.authplatform.auth.dto.RefreshTokenRequest;
 import com.authplatform.auth.dto.RefreshTokenResponse;
 import com.authplatform.auth.entity.RefreshToken;
+import com.authplatform.auth.entity.Session;
 import com.authplatform.auth.entity.User;
 import com.authplatform.auth.exception.InvalidRefreshTokenException;
 import com.authplatform.auth.repository.RefreshTokenRepository;
@@ -40,13 +41,13 @@ public class RefreshTokenService {
     }
 
     @Transactional
-    public RefreshToken generateRefreshToken(User user, String deviceId, String ipAddress, String userAgent) {
+    public IssuedRefreshToken generateRefreshToken(User user, String deviceId, String ipAddress, String userAgent) {
         Instant expiresAt = Instant.now().plusSeconds(jwtProperties.refreshExpiration());
         RefreshToken refreshToken = new RefreshToken(user.getId(), generateOpaqueToken(), expiresAt, deviceId);
         RefreshToken saved = refreshTokenRepository.save(refreshToken);
 
-        sessionService.createSession(user.getId(), saved.getToken(), expiresAt, ipAddress, userAgent);
-        return saved;
+        Session session = sessionService.createSession(user.getId(), saved.getToken(), expiresAt, ipAddress, userAgent);
+        return new IssuedRefreshToken(saved, session.getId());
     }
 
     @Transactional(readOnly = true)
@@ -74,13 +75,14 @@ public class RefreshTokenService {
         User user = userRepository.findById(oldToken.getUserId())
                 .orElseThrow(InvalidRefreshTokenException::new);
 
-        String newAccessToken = jwtService.generateToken(user.getEmail());
         Instant newExpiresAt = Instant.now().plusSeconds(jwtProperties.refreshExpiration());
         RefreshToken newToken = new RefreshToken(user.getId(), generateOpaqueToken(), newExpiresAt, oldToken.getDeviceId());
         refreshTokenRepository.save(newToken);
         revokeRefreshToken(oldToken);
 
-        sessionService.updateLastUsed(oldToken.getToken(), newToken.getToken(), newExpiresAt);
+        Session session = sessionService.updateLastUsed(oldToken.getToken(), newToken.getToken(), newExpiresAt)
+                .orElseThrow(InvalidRefreshTokenException::new);
+        String newAccessToken = jwtService.generateToken(user.getEmail(), session.getId());
 
         log.info("Refresh token rotated for userId={}", user.getId());
         return new RefreshTokenResponse(newAccessToken, newToken.getToken());

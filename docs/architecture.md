@@ -18,6 +18,8 @@ flowchart TB
             RegCtrl[RegistrationController]
             LoginCtrl[LoginController]
             RefreshCtrl[RefreshTokenController]
+            LogoutCtrl[LogoutController]
+            SessionCtrl[SessionController]
             UserCtrl[UserController]
         end
 
@@ -25,6 +27,7 @@ flowchart TB
             RegSvc[RegistrationService]
             AuthSvc[AuthenticationService]
             RefreshSvc[RefreshTokenService]
+            SessionSvc[SessionService]
             UserSvc[UserService]
         end
 
@@ -35,20 +38,27 @@ flowchart TB
 
         Repo[UserRepository]
         RefreshRepo[RefreshTokenRepository]
+        SessionRepo[SessionRepository]
         GEH[GlobalExceptionHandler]
     end
 
-    DB[("PostgreSQL<br/>auth_platform.users /<br/>refresh_tokens")]
+    DB[("PostgreSQL<br/>auth_platform.users /<br/>refresh_tokens / sessions")]
 
     Client --> SecurityFilterChain
     SecurityFilterChain --> RegCtrl
     SecurityFilterChain --> LoginCtrl
     SecurityFilterChain --> RefreshCtrl
+    SecurityFilterChain --> LogoutCtrl
+    SecurityFilterChain --> SessionCtrl
     SecurityFilterChain --> UserCtrl
 
     RegCtrl --> RegSvc
     LoginCtrl --> AuthSvc
     RefreshCtrl --> RefreshSvc
+    LogoutCtrl --> RefreshSvc
+    LogoutCtrl --> Repo
+    SessionCtrl --> SessionSvc
+    SessionCtrl --> Repo
     UserCtrl --> UserSvc
 
     RegSvc --> PwEncoder
@@ -60,17 +70,27 @@ flowchart TB
     RefreshSvc --> JwtSvc
     RefreshSvc --> Repo
     RefreshSvc --> RefreshRepo
+    RefreshSvc --> SessionSvc
+    SessionSvc --> SessionRepo
     UserSvc --> Repo
 
     SecurityFilterChain -.uses.-> JwtSvc
     Repo --> DB
     RefreshRepo --> DB
+    SessionRepo --> DB
 
     RegCtrl -.exceptions.-> GEH
     LoginCtrl -.exceptions.-> GEH
     RefreshCtrl -.exceptions.-> GEH
+    LogoutCtrl -.exceptions.-> GEH
+    SessionCtrl -.exceptions.-> GEH
     UserCtrl -.exceptions.-> GEH
 ```
+
+Note the one-way arrow `RefreshSvc --> SessionSvc`, not the reverse — `SessionService`
+never depends on `RefreshTokenService`. That's deliberate; see
+[decisions.md](decisions.md#decision-13-one-service-owns-both-refreshtoken-and-session-to-avoid-a-circular-dependency)
+for why the two would otherwise form a circular bean dependency.
 
 **Why three services instead of one `UserService`:** registration, authentication, and
 profile lookup are different responsibilities with different reasons to change —
@@ -113,9 +133,10 @@ sequenceDiagram
     participant Enc as PasswordEncoder
     participant Jwt as JwtService
     participant RSvc as RefreshTokenService
+    participant SSvc as SessionService
 
-    C->>Ctrl: POST /api/v1/auth/login
-    Ctrl->>Svc: login(request)
+    C->>Ctrl: POST /api/v1/auth/login<br/>(Ctrl reads IP + User-Agent)
+    Ctrl->>Svc: login(request, ipAddress, userAgent)
     Svc->>Repo: findByEmail(email)
     alt not found
         Svc-->>Ctrl: throw InvalidCredentialsException
@@ -128,8 +149,11 @@ sequenceDiagram
         else valid
             Svc->>Jwt: generateToken(email)
             Jwt-->>Svc: signed JWT
-            Svc->>RSvc: generateRefreshToken(user, deviceId)
-            RSvc-->>Svc: opaque refresh token (saved to DB)
+            Svc->>RSvc: generateRefreshToken(user, deviceId, ip, userAgent)
+            RSvc->>RSvc: save RefreshToken
+            RSvc->>SSvc: createSession(userId, token, expiresAt, ip, userAgent)
+            SSvc-->>RSvc: Session saved (device parsed from User-Agent)
+            RSvc-->>Svc: opaque refresh token
             Svc-->>Ctrl: LoginResponse(accessToken, "Bearer", refreshToken, 900)
             Ctrl-->>C: 200 OK
         end
@@ -150,6 +174,7 @@ sequenceDiagram
     participant Repo as RefreshTokenRepository
     participant URepo as UserRepository
     participant Jwt as JwtService
+    participant SSvc as SessionService
 
     C->>Ctrl: POST /api/v1/auth/refresh
     Ctrl->>Svc: rotateRefreshToken(request)
@@ -163,6 +188,8 @@ sequenceDiagram
         Jwt-->>Svc: new access token
         Svc->>Repo: save(new RefreshToken, same deviceId)
         Svc->>Repo: save(oldToken, revoked=true)
+        Svc->>SSvc: updateLastUsed(oldToken, newToken, newExpiresAt)
+        SSvc->>SSvc: find session by old token, swap in new token + expiry, bump lastUsed
         Svc-->>Ctrl: RefreshTokenResponse(newAccessToken, newRefreshToken)
         Ctrl-->>C: 200 OK
     end
@@ -171,6 +198,41 @@ sequenceDiagram
 The old refresh token is never deleted, only flagged `revoked = true` — reusing it
 after rotation fails the same way an unknown token would. See
 [decisions.md](decisions.md#decision-11-rotate-and-revoke-on-every-refresh-never-reuse-a-refresh-token).
+Note the session row is *updated in place*, not duplicated — one row per device
+persists across every rotation until logout.
+
+## Request flow — logout and logout-all
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant LCtrl as LogoutController
+    participant RSvc as RefreshTokenService
+    participant SSvc as SessionService
+
+    rect rgb(40,40,40)
+    note over C,SSvc: POST /api/v1/auth/logout — public, refresh token proves intent
+    C->>LCtrl: POST /logout {refreshToken}
+    LCtrl->>RSvc: logout(refreshToken)
+    RSvc->>RSvc: validateRefreshToken() then revoke it
+    RSvc->>SSvc: deleteByRefreshToken(refreshToken)
+    RSvc-->>LCtrl: done
+    LCtrl-->>C: 204 No Content
+    end
+
+    rect rgb(40,40,40)
+    note over C,SSvc: POST /api/v1/auth/logout-all — requires a valid JWT
+    C->>LCtrl: POST /logout-all<br/>Authorization: Bearer <token>
+    LCtrl->>RSvc: logoutAll(userId from JWT)
+    RSvc->>RSvc: revoke every RefreshToken for userId
+    RSvc->>SSvc: revokeAndDeleteAllForUser(userId)
+    RSvc-->>LCtrl: done
+    LCtrl-->>C: 204 No Content
+    end
+```
+
+See [decisions.md](decisions.md#decision-14-logout-is-public-logout-all-requires-a-valid-access-token)
+for why these two have different access rules.
 
 ## Security flow — JWT on a protected request
 
@@ -206,6 +268,9 @@ sequenceDiagram
 | `POST /api/v1/auth/register` | public |
 | `POST /api/v1/auth/login` | public |
 | `POST /api/v1/auth/refresh` | public (the caller has no valid access token by definition) |
+| `POST /api/v1/auth/logout` | public (a valid refresh token is sufficient proof of intent) |
+| `POST /api/v1/auth/logout-all` | requires a valid JWT — see [decisions.md](decisions.md#decision-14-logout-is-public-logout-all-requires-a-valid-access-token) |
+| `GET /api/v1/sessions` | requires a valid JWT |
 | `/swagger-ui/**`, `/v3/api-docs/**` | public (dev tooling only) |
 | everything else | requires a valid JWT |
 

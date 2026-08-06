@@ -24,12 +24,13 @@ public class JwtService {
         this.signingKey = Keys.hmacShaKeyFor(jwtProperties.secret().getBytes(StandardCharsets.UTF_8));
     }
 
-    public String generateToken(String subject) {
+    public String generateToken(String subject, Long sessionId) {
         Instant now = Instant.now();
         Instant expiry = now.plusSeconds(jwtProperties.expiration());
 
         return Jwts.builder()
                 .subject(subject)
+                .claim("sid", String.valueOf(sessionId))
                 .issuedAt(Date.from(now))
                 .expiration(Date.from(expiry))
                 .signWith(signingKey)
@@ -46,6 +47,10 @@ public class JwtService {
 
     public String extractUsername(String token) {
         return extractClaims(token).getSubject();
+    }
+
+    public Long extractSessionId(String token) {
+        return Long.valueOf(extractClaims(token).get("sid", String.class));
     }
 
     public boolean isTokenExpired(String token) {

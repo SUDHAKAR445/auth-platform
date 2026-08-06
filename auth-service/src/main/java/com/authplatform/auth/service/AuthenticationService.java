@@ -3,7 +3,6 @@ package com.authplatform.auth.service;
 import com.authplatform.auth.config.JwtProperties;
 import com.authplatform.auth.dto.LoginRequest;
 import com.authplatform.auth.dto.LoginResponse;
-import com.authplatform.auth.entity.RefreshToken;
 import com.authplatform.auth.entity.User;
 import com.authplatform.auth.entity.UserStatus;
 import com.authplatform.auth.exception.InvalidCredentialsException;
@@ -53,10 +52,10 @@ public class AuthenticationService {
             throw new InvalidCredentialsException();
         }
 
-        String accessToken = jwtService.generateToken(user.getEmail());
-        RefreshToken refreshToken = refreshTokenService.generateRefreshToken(user, request.deviceId(), ipAddress, userAgent);
+        IssuedRefreshToken issued = refreshTokenService.generateRefreshToken(user, request.deviceId(), ipAddress, userAgent);
+        String accessToken = jwtService.generateToken(user.getEmail(), issued.sessionId());
 
         log.info("Login successful for email={}", request.email());
-        return new LoginResponse(accessToken, "Bearer", refreshToken.getToken(), jwtProperties.expiration());
+        return new LoginResponse(accessToken, "Bearer", issued.refreshToken().getToken(), jwtProperties.expiration());
     }
 }

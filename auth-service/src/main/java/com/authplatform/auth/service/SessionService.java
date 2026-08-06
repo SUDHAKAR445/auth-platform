@@ -8,6 +8,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 
 @Service
 public class SessionService {
@@ -29,13 +30,21 @@ public class SessionService {
 
     /** Called on every refresh-token rotation: the session survives, its token and expiry move forward. */
     @Transactional
-    public void updateLastUsed(String oldRefreshToken, String newRefreshToken, Instant newExpiresAt) {
-        sessionRepository.findByRefreshToken(oldRefreshToken).ifPresent(session -> {
+    public Optional<Session> updateLastUsed(String oldRefreshToken, String newRefreshToken, Instant newExpiresAt) {
+        return sessionRepository.findByRefreshToken(oldRefreshToken).map(session -> {
             session.setRefreshToken(newRefreshToken);
             session.setExpiresAt(newExpiresAt);
             session.setLastUsed(Instant.now());
-            sessionRepository.save(session);
+            return sessionRepository.save(session);
         });
+    }
+
+    /** Checked on every authenticated request via JwtAuthenticationFilter — see decisions.md #15. */
+    @Transactional(readOnly = true)
+    public boolean isSessionActive(Long sessionId) {
+        return sessionRepository.findById(sessionId)
+                .map(session -> !session.isRevoked() && session.getExpiresAt().isAfter(Instant.now()))
+                .orElse(false);
     }
 
     @Transactional

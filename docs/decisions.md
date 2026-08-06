@@ -110,9 +110,13 @@ problem across services that JWT was chosen to avoid. Stateless also means any
 instance of `auth-service` can handle any request with no session-affinity routing
 needed, which matters once this sits behind a load balancer or the planned gateway.
 
-**Trade-off we accepted:** No server-side "log out everywhere" button — invalidating
-a session is instant server-side, invalidating a JWT before it naturally expires
-requires extra machinery we haven't built yet.
+**Trade-off we accepted:** A live access token can't be revoked server-side before it
+naturally expires — the 15-minute expiry is the ceiling on how long that exposure
+lasts. "Log out everywhere" (see
+[Decision 12](decisions.md#decision-12-session-as-a-separate-entity-from-refreshtoken))
+revokes every *refresh* token immediately, so a logged-out user can't get a *new*
+access token — but any access token already handed out keeps working until it
+expires on its own.
 
 ---
 
@@ -307,3 +311,98 @@ trail of the rotation chain if we ever need to investigate a compromised account
 **Trade-off we accepted:** Slightly more writes per refresh (revoke old + insert
 new, instead of just reading the old one) — a small, fixed cost in exchange for a
 real security signal instead of none.
+
+---
+
+## Decision 12: Session as a separate entity from RefreshToken
+
+**Context:** Adding "show me my active devices" and "log out this device"/"log out
+everywhere" needed somewhere to track *which device* each refresh token belongs to,
+its IP, its user-agent, and when it was last used. `RefreshToken` already existed
+and could have grown these columns directly.
+
+**Options considered:**
+- Add device/IP/user-agent/last-used columns straight onto `RefreshToken`
+- A separate `Session` entity, one row per logged-in device, referencing the current
+  refresh token by value
+
+**Decision:** Separate `Session` table, kept in sync with `RefreshToken` by
+`RefreshTokenService` (which now owns both).
+
+**Why:** `RefreshToken` is a security-critical, minimal record — its only jobs are
+"is this token valid" and "revoke it." `Session` is a UX/audit-facing record with a
+completely different reason to change (a new field for "list your devices" someday,
+or richer device parsing, has nothing to do with token validity logic). Bolting
+device metadata onto `RefreshToken` would mean every future session-management
+feature touches the same class that also handles security-critical revocation
+checks — exactly the kind of god-class growth Decision 7 already rejected once.
+Keeping them separate also matches the actual flows we were asked to build: logout
+explicitly *validates and revokes the token, then separately deletes the session* —
+two distinct operations on two distinct records, not one.
+
+**Trade-off we accepted:** Two tables to keep in sync instead of one — every place
+that creates or rotates a refresh token must also remember to create or update its
+session row. We contained this by making `RefreshTokenService` the *only* class that
+touches both (see [Decision 13](decisions.md#decision-13-one-service-owns-both-refreshtoken-and-session-to-avoid-a-circular-dependency)),
+so "keeping them in sync" is centralized in one place, not scattered.
+
+---
+
+## Decision 13: One service owns both RefreshToken and Session, to avoid a circular dependency
+
+**Context:** Logging out needs to revoke a `RefreshToken` *and* delete its `Session`.
+Rotating a refresh token needs to update its `Session`'s last-used time and token
+value. Both operations touch both entities — the question is which service is
+allowed to depend on which.
+
+**Options considered:**
+- `RefreshTokenService` and `SessionService` each call into the other as needed
+- Only one of them is allowed to depend on the other; the other stays "pure"
+
+**Decision:** `RefreshTokenService` depends on `SessionService`. `SessionService`
+depends on nothing but `SessionRepository` — it never calls back into
+`RefreshTokenService`.
+
+**Why:** Letting both services call each other creates a circular bean dependency —
+Spring can't construct either one first, since each needs the other already built.
+Rather than reach for constructor tricks to work around that, the actual fix is
+architectural: pick one direction. `RefreshTokenService` was the natural owner,
+since "generate/rotate/revoke a refresh token" was already its job, and a session is
+really just "the device that refresh token belongs to" — a detail of the token's
+lifecycle, not a peer concept that needs equal say.
+
+**Trade-off we accepted:** `SessionService` can't independently trigger a token
+revocation (e.g. it has no way to say "this session looks suspicious, kill its
+token") — that logic would have to live in whatever calls both services, since
+`SessionService` isn't allowed to reach for `RefreshTokenService` itself. Not a
+concern for anything asked for so far.
+
+---
+
+## Decision 14: `/logout` is public, `/logout-all` requires a valid access token
+
+**Context:** Both endpoints end a user's login state, but they were specified with
+different inputs: `/logout` takes a refresh token in the body; `/logout-all` takes
+no body at all.
+
+**Options considered:**
+- Require a valid access token for both
+- `/logout` public (refresh token is the only proof needed), `/logout-all` behind
+  the standard `anyRequest().authenticated()` rule
+
+**Decision:** Asymmetric — `/logout` added to the public route list,
+`/logout-all` left protected.
+
+**Why:** `/logout` has a concrete token in its request body to validate against —
+that's sufficient proof of intent, and it has to be public because a client logging
+out may have *already* let its 15-minute access token expire while still holding a
+valid refresh token; requiring a fresh access token just to log out would be a dead
+end for that client. `/logout-all` has no such token in its request — the *only*
+way to know whose sessions to wipe is to read it off a currently-valid JWT, which
+means it can't be public by construction, not just by policy choice.
+
+**Trade-off we accepted:** A stolen refresh token alone is enough to call `/logout`
+on someone else's session — but that only lets an attacker log the real user out,
+which is a nuisance, not a compromise (they still can't read data or get a new
+access token without the token also being valid, which `/logout` immediately makes
+false anyway).

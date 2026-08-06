@@ -148,6 +148,83 @@ Always store the new `refreshToken` from the response and discard the old one.
 
 ---
 
+## `POST /api/v1/auth/logout`
+
+Revokes a single refresh token and deletes its session. Public — no access token
+required (see [decisions.md](decisions.md#decision-14-logout-is-public-logout-all-requires-a-valid-access-token)).
+
+**Request**
+
+```json
+{ "refreshToken": "5kQ3f1z...opaque-string..." }
+```
+
+| Field | Rules |
+|---|---|
+| `refreshToken` | required |
+
+**Success response — `204 No Content`** (empty body)
+
+After this call, the refresh token you sent can no longer be used at
+`POST /api/v1/auth/refresh` — and its session no longer appears in
+`GET /api/v1/sessions`.
+
+**Error responses**
+
+| Status | Cause | Body |
+|---|---|---|
+| `400` | missing/blank `refreshToken` | `ErrorResponse` with `fieldErrors` |
+| `401` | token not found, already revoked, or expired | `ErrorResponse`, message: `Invalid or expired refresh token` |
+
+---
+
+## `POST /api/v1/auth/logout-all`
+
+Revokes **every** refresh token and deletes **every** session belonging to the
+authenticated user — "log out of all devices." **Requires** a valid JWT
+(`Authorization: Bearer <token>`). No request body.
+
+**Success response — `204 No Content`** (empty body)
+
+Every access token already issued keeps working until it naturally expires (up to
+15 minutes) — only the ability to get a *new* one via `/refresh` is cut off
+immediately. See [decisions.md](decisions.md#decision-4-stateless-authentication).
+
+**Error responses**
+
+| Status | Cause | Body |
+|---|---|---|
+| `401` | no token, malformed token, or expired token | (no body — rejected by `SecurityConfig` before reaching the controller) |
+
+---
+
+## `GET /api/v1/sessions`
+
+Lists the authenticated user's active (non-revoked, non-expired) sessions —
+one entry per logged-in device. **Requires** a valid JWT.
+
+**Success response — `200 OK`**
+
+```json
+[
+  { "device": "Chrome", "ip": "192.168.1.1", "lastUsed": "2026-08-05T10:00:00Z" },
+  { "device": "Android", "ip": "192.168.1.20", "lastUsed": "2026-08-05T09:30:00Z" }
+]
+```
+
+`device` is parsed from the request's `User-Agent` header at login time (a small
+heuristic — recognizes `Android`, `iPhone`, `iPad`, `Chrome`, `Firefox`, `Safari`,
+`Edge`; falls back to `"Unknown"`). `lastUsed` updates every time that session's
+refresh token is rotated via `/refresh`.
+
+**Error responses**
+
+| Status | Cause | Body |
+|---|---|---|
+| `401` | no token, malformed token, or expired token | (no body — rejected by `SecurityConfig` before reaching the controller) |
+
+---
+
 ## `GET /api/v1/users/{id}`
 
 Fetches a user's profile. **Requires** a valid JWT (`Authorization: Bearer <token>`).
@@ -182,8 +259,9 @@ Never includes the password hash.
 
 | Code | Meaning here |
 |---|---|
-| `200` | login succeeded / user found |
+| `200` | login succeeded / user found / active sessions listed |
 | `201` | user registered |
+| `204` | logout / logout-all succeeded (no body to return) |
 | `400` | request body failed Bean Validation |
 | `401` | missing/invalid JWT, invalid login credentials, or invalid/expired/revoked refresh token |
 | `404` | user id doesn't exist |
