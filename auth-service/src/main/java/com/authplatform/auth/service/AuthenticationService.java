@@ -37,7 +37,7 @@ public class AuthenticationService {
     }
 
     @Transactional
-    public LoginResponse login(LoginRequest request) {
+    public LoginResponse login(LoginRequest request, String ipAddress, String userAgent) {
         log.info("Login attempt for email={}", request.email());
 
         User user = userRepository.findByEmail(request.email())
@@ -54,7 +54,7 @@ public class AuthenticationService {
         }
 
         String accessToken = jwtService.generateToken(user.getEmail());
-        RefreshToken refreshToken = refreshTokenService.generateRefreshToken(user, request.deviceId());
+        RefreshToken refreshToken = refreshTokenService.generateRefreshToken(user, request.deviceId(), ipAddress, userAgent);
 
         log.info("Login successful for email={}", request.email());
         return new LoginResponse(accessToken, "Bearer", refreshToken.getToken(), jwtProperties.expiration());

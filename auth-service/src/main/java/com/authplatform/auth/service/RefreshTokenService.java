@@ -28,20 +28,25 @@ public class RefreshTokenService {
     private final UserRepository userRepository;
     private final JwtService jwtService;
     private final JwtProperties jwtProperties;
+    private final SessionService sessionService;
 
     public RefreshTokenService(RefreshTokenRepository refreshTokenRepository, UserRepository userRepository,
-                                JwtService jwtService, JwtProperties jwtProperties) {
+                                JwtService jwtService, JwtProperties jwtProperties, SessionService sessionService) {
         this.refreshTokenRepository = refreshTokenRepository;
         this.userRepository = userRepository;
         this.jwtService = jwtService;
         this.jwtProperties = jwtProperties;
+        this.sessionService = sessionService;
     }
 
     @Transactional
-    public RefreshToken generateRefreshToken(User user, String deviceId) {
+    public RefreshToken generateRefreshToken(User user, String deviceId, String ipAddress, String userAgent) {
         Instant expiresAt = Instant.now().plusSeconds(jwtProperties.refreshExpiration());
         RefreshToken refreshToken = new RefreshToken(user.getId(), generateOpaqueToken(), expiresAt, deviceId);
-        return refreshTokenRepository.save(refreshToken);
+        RefreshToken saved = refreshTokenRepository.save(refreshToken);
+
+        sessionService.createSession(user.getId(), saved.getToken(), expiresAt, ipAddress, userAgent);
+        return saved;
     }
 
     @Transactional(readOnly = true)
@@ -70,11 +75,34 @@ public class RefreshTokenService {
                 .orElseThrow(InvalidRefreshTokenException::new);
 
         String newAccessToken = jwtService.generateToken(user.getEmail());
-        RefreshToken newToken = generateRefreshToken(user, oldToken.getDeviceId());
+        Instant newExpiresAt = Instant.now().plusSeconds(jwtProperties.refreshExpiration());
+        RefreshToken newToken = new RefreshToken(user.getId(), generateOpaqueToken(), newExpiresAt, oldToken.getDeviceId());
+        refreshTokenRepository.save(newToken);
         revokeRefreshToken(oldToken);
+
+        sessionService.updateLastUsed(oldToken.getToken(), newToken.getToken(), newExpiresAt);
 
         log.info("Refresh token rotated for userId={}", user.getId());
         return new RefreshTokenResponse(newAccessToken, newToken.getToken());
+    }
+
+    @Transactional
+    public void logout(String refreshTokenValue) {
+        RefreshToken refreshToken = validateRefreshToken(refreshTokenValue);
+        revokeRefreshToken(refreshToken);
+        sessionService.deleteByRefreshToken(refreshTokenValue);
+        log.info("Logout successful for userId={}", refreshToken.getUserId());
+    }
+
+    @Transactional
+    public void logoutAll(Long userId) {
+        refreshTokenRepository.findByUserId(userId)
+                .forEach(token -> {
+                    token.setRevoked(true);
+                    refreshTokenRepository.save(token);
+                });
+        sessionService.revokeAndDeleteAllForUser(userId);
+        log.info("Logout-all successful for userId={}", userId);
     }
 
     private String generateOpaqueToken() {
