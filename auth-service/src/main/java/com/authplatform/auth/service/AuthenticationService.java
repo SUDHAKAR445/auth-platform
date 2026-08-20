@@ -5,6 +5,7 @@ import com.authplatform.auth.dto.LoginRequest;
 import com.authplatform.auth.dto.LoginResponse;
 import com.authplatform.auth.entity.User;
 import com.authplatform.auth.entity.UserStatus;
+import com.authplatform.auth.exception.EmailNotVerifiedException;
 import com.authplatform.auth.exception.InvalidCredentialsException;
 import com.authplatform.auth.repository.UserRepository;
 import com.authplatform.auth.security.JwtService;
@@ -45,6 +46,11 @@ public class AuthenticationService {
         if (!passwordEncoder.matches(request.password(), user.getPassword())) {
             log.warn("Login failed for email={}: wrong password", request.email());
             throw new InvalidCredentialsException();
+        }
+
+        if (!user.isEmailVerified()) {
+            log.warn("Login blocked for email={}: email not verified", request.email());
+            throw new EmailNotVerifiedException();
         }
 
         if (user.getStatus() != UserStatus.ACTIVE) {

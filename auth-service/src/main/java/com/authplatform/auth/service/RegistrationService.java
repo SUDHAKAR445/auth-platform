@@ -3,6 +3,7 @@ package com.authplatform.auth.service;
 import com.authplatform.auth.dto.RegisterRequest;
 import com.authplatform.auth.dto.RegisterResponse;
 import com.authplatform.auth.entity.User;
+import com.authplatform.auth.entity.VerificationToken;
 import com.authplatform.auth.exception.UserAlreadyExistsException;
 import com.authplatform.auth.mapper.UserMapper;
 import com.authplatform.auth.repository.UserRepository;
@@ -20,11 +21,16 @@ public class RegistrationService {
     private final UserRepository userRepository;
     private final UserMapper userMapper;
     private final PasswordEncoder passwordEncoder;
+    private final EmailVerificationService emailVerificationService;
+    private final EmailService emailService;
 
-    public RegistrationService(UserRepository userRepository, UserMapper userMapper, PasswordEncoder passwordEncoder) {
+    public RegistrationService(UserRepository userRepository, UserMapper userMapper, PasswordEncoder passwordEncoder,
+                                EmailVerificationService emailVerificationService, EmailService emailService) {
         this.userRepository = userRepository;
         this.userMapper = userMapper;
         this.passwordEncoder = passwordEncoder;
+        this.emailVerificationService = emailVerificationService;
+        this.emailService = emailService;
     }
 
     @Transactional
@@ -39,7 +45,10 @@ public class RegistrationService {
         user.setPassword(passwordEncoder.encode(request.password()));
         User saved = userRepository.save(user);
 
-        log.info("User registered successfully id={} email={}", saved.getId(), saved.getEmail());
-        return RegisterResponse.of("Registration Successful");
+        VerificationToken token = emailVerificationService.generateVerificationToken(saved);
+        emailService.sendVerificationEmail(saved.getEmail(), token.getToken());
+
+        log.info("User registered successfully id={} email={} status=PENDING", saved.getId(), saved.getEmail());
+        return RegisterResponse.of("Registration successful. Please verify your email to activate your account.");
     }
 }

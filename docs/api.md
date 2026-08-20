@@ -48,8 +48,15 @@ Creates a new user. Public — no token required.
 **Success response — `201 Created`**
 
 ```json
-{ "message": "Registration Successful" }
+{ "message": "Registration successful. Please verify your email to activate your account." }
 ```
+
+The new user is created with `status: PENDING` and `emailVerified: false` — they
+cannot log in until they complete email verification (see
+[decisions.md](decisions.md#decision-16-require-email-verification-before-an-account-can-log-in)).
+Registration also triggers `POST`-equivalent side effects: a `VerificationToken` row
+is created and `EmailService.sendVerificationEmail()` prints a verification link to
+the console (see `GET /api/v1/auth/verify` below).
 
 **Error responses**
 
@@ -106,6 +113,7 @@ not a JWT (see [decisions.md](decisions.md#decision-10-opaque-database-backed-re
 |---|---|---|
 | `400` | missing/blank email or password | `ErrorResponse` with `fieldErrors` |
 | `401` | email not found, OR wrong password, OR account status ≠ `ACTIVE` | `ErrorResponse`, message: `Invalid email or password` (deliberately identical for all three causes — see [decisions.md](decisions.md#decision-3-one-generic-error-for-every-login-failure)) |
+| `403` | password is correct, but `emailVerified` is still `false` | `ErrorResponse`, message: `Please verify your email before logging in` — see [decisions.md](decisions.md#decision-16-require-email-verification-before-an-account-can-log-in) |
 
 ---
 
@@ -198,6 +206,75 @@ immediately. See [decisions.md](decisions.md#decision-4-stateless-authentication
 
 ---
 
+## `GET /api/v1/auth/verify`
+
+Activates a pending account. Public — the caller isn't logged in yet by definition.
+
+**Request** — query parameter, not a body:
+
+```
+GET /api/v1/auth/verify?token=5kQ3f1z...opaque-string...
+```
+
+| Parameter | Rules |
+|---|---|
+| `token` | required |
+
+**Success response — `200 OK`**
+
+```json
+{ "message": "Email verified successfully" }
+```
+
+After this call, the user's `status` becomes `ACTIVE` and `emailVerified` becomes
+`true` — they can now log in. The token itself is deleted and cannot be used again,
+even if it hasn't expired (see
+[decisions.md](decisions.md#decision-19-one-time-tokens-delete-on-use-not-just-a-used-flag)).
+
+**Error responses**
+
+| Status | Cause | Body |
+|---|---|---|
+| `400` | token not found, already used, or expired (24-hour window, see [decisions.md](decisions.md#decision-18-verification-tokens-expire)) | `ErrorResponse`, message: `Invalid or expired verification token` |
+
+---
+
+## `POST /api/v1/auth/resend-verification`
+
+Issues a new verification token and email for an account that hasn't verified yet.
+Public.
+
+**Request**
+
+```json
+{ "email": "user@gmail.com" }
+```
+
+| Field | Rules |
+|---|---|
+| `email` | required, valid email format |
+
+**Success response — `200 OK`**, always the same regardless of what actually happened:
+
+```json
+{ "message": "If an account exists for this email and isn't verified yet, a verification email has been sent." }
+```
+
+This response is intentionally identical whether the email doesn't exist, is
+already verified, or genuinely got a new token — same enumeration-prevention
+reasoning as login (see
+[decisions.md](decisions.md#decision-3-one-generic-error-for-every-login-failure)).
+There is no error response that reveals which case occurred; a malformed email
+still gets a `400` for the field validation itself.
+
+**Error responses**
+
+| Status | Cause | Body |
+|---|---|---|
+| `400` | missing/blank or malformed `email` | `ErrorResponse` with `fieldErrors` |
+
+---
+
 ## `GET /api/v1/sessions`
 
 Lists the authenticated user's active (non-revoked, non-expired) sessions —
@@ -262,8 +339,9 @@ Never includes the password hash.
 | `200` | login succeeded / user found / active sessions listed |
 | `201` | user registered |
 | `204` | logout / logout-all succeeded (no body to return) |
-| `400` | request body failed Bean Validation |
-| `401` | missing/invalid JWT, invalid login credentials, or invalid/expired/revoked refresh token |
+| `400` | request body failed Bean Validation, or an invalid/expired/used verification token |
+| `401` | missing/invalid JWT, invalid login credentials, invalid/expired/revoked refresh token, or a valid-but-revoked session (see [decisions.md](decisions.md#decision-15-check-session-revocation-on-every-request-not-just-token-expiry)) |
+| `403` | login attempted before email verification |
 | `404` | user id doesn't exist |
 | `409` | email already registered |
 | `500` | unhandled server error (logged, generic message returned — internals never leak to the client) |

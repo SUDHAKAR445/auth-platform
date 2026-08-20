@@ -34,10 +34,13 @@ shared state and zero extra network hop. That property matters more as the syste
 grows past one service.
 
 **Trade-off we accepted:** JWTs can't be revoked before they expire without extra
-infrastructure. We mitigated this with a short 15-minute expiry plus a separate
+infrastructure — mitigated with a short 15-minute expiry plus a separate
 refresh-token flow (see
-[Decision 10](decisions.md#decision-10-opaque-database-backed-refresh-tokens-instead-of-a-second-jwt))
-that gives us a revocation point the access token itself doesn't have.
+[Decision 10](decisions.md#decision-10-opaque-database-backed-refresh-tokens-instead-of-a-second-jwt)).
+We later closed most of this gap anyway: see
+[Decision 15](decisions.md#decision-15-check-session-revocation-on-every-request-not-just-token-expiry),
+where every request now re-checks the token's session, at the cost of the
+statelessness this decision was originally chosen for.
 
 ---
 
@@ -110,13 +113,12 @@ problem across services that JWT was chosen to avoid. Stateless also means any
 instance of `auth-service` can handle any request with no session-affinity routing
 needed, which matters once this sits behind a load balancer or the planned gateway.
 
-**Trade-off we accepted:** A live access token can't be revoked server-side before it
-naturally expires — the 15-minute expiry is the ceiling on how long that exposure
-lasts. "Log out everywhere" (see
-[Decision 12](decisions.md#decision-12-session-as-a-separate-entity-from-refreshtoken))
-revokes every *refresh* token immediately, so a logged-out user can't get a *new*
-access token — but any access token already handed out keeps working until it
-expires on its own.
+**Trade-off we accepted, later revisited:** Originally, a live access token couldn't
+be revoked server-side before it naturally expired — the 15-minute expiry was the
+ceiling on that exposure. We decided that ceiling was too loose (see
+[Decision 15](decisions.md#decision-15-check-session-revocation-on-every-request-not-just-token-expiry))
+and added a per-request session check, so a logged-out user's access token now stops
+working on the very next request, not after up to 15 minutes.
 
 ---
 
@@ -406,3 +408,168 @@ on someone else's session — but that only lets an attacker log the real user o
 which is a nuisance, not a compromise (they still can't read data or get a new
 access token without the token also being valid, which `/logout` immediately makes
 false anyway).
+
+---
+
+## Decision 15: Check session revocation on every request, not just token expiry
+
+**Context:** `JwtAuthenticationFilter` only checked a token's signature and its own
+`exp` claim — pure math, no database lookup, exactly per Decision 1. That meant
+`/logout` and `/logout-all` only ever stopped a client from getting a *new* access
+token; any access token already issued kept working, fully authenticated, until it
+naturally expired — up to 15 minutes after the user explicitly logged out.
+
+**Options considered:**
+- Leave it as-is: stateless, zero per-request cost, bounded only by the 15-minute
+  access token TTL
+- Embed a session id in the access token and check `Session.revoked` in Postgres on
+  every authenticated request
+- Same check, but backed by a fast cache (Redis) instead of hitting Postgres directly
+- Shrink the access token TTL instead of adding any check at all
+
+**Decision:** Add the session id as a JWT claim (`sid`) and check it against
+Postgres on every request, for now — with an explicit intent to move the same check
+to Redis once that's introduced.
+
+**Why:** A revoked session that still grants access for up to 15 minutes is a real
+window, not a theoretical one — long enough to matter if the reason for the logout
+was a stolen device or a compromised token. Once we chose to close that window, the
+DB check was the immediately available option that didn't require standing up new
+infrastructure just to ship this. Shrinking the TTL instead was rejected because it
+only narrows the exposure window, it doesn't close it — and it makes every client
+refresh far more often for no correctness gain.
+
+**Trade-off we accepted:** This is a direct, explicit walk-back of Decision 1's
+core premise — every authenticated request now costs one Postgres query
+(`SessionRepository.findById`) before it ever reaches a controller, the exact
+per-request database dependency JWTs were originally chosen to avoid. We contained
+the damage in one specific way: the check lives entirely inside
+`JwtAuthenticationFilter` and `SessionService.isSessionActive()`, so swapping
+Postgres for a Redis lookup later is a change to those two spots only — noted
+directly in the code as a `TODO` — not a redesign of how tokens work.
+
+---
+
+## Decision 16: Require email verification before an account can log in
+
+**Context:** Registration previously created an `ACTIVE` user immediately — anyone
+could register with an email address they don't control (a typo, or someone else's
+address) and the account would work right away.
+
+**Options considered:**
+- Skip verification: activate accounts immediately at registration (the old
+  behavior)
+- Require verification: new accounts start `PENDING` and can't log in until they
+  click a link proving they control the email address
+
+**Decision:** New users start in `PENDING` status with `emailVerified = false`;
+`AuthenticationService.login()` rejects login with `403` until that flips to
+verified (see [Decision 17](decisions.md#decision-17-opaque-database-backed-verification-tokens-mirroring-refreshtoken)
+for how verification actually happens).
+
+**Why:** An email address is the *only* channel this system has to reach a user —
+password resets, security alerts, and (eventually) MFA all assume it's real and
+reachable. Registering without proving that costs nothing and catches typos,
+squatting, and abuse (mass-registering accounts against addresses you don't own)
+before they become a real account with real access. It's also a prerequisite for
+the "disabled user" and account-status roadmap items from earlier days — `PENDING`
+is now a real, meaningful state in the lifecycle, not just a placeholder.
+
+**Trade-off we accepted:** A brand-new, legitimate user can't log in immediately
+after registering — they must find and click the email first. That's a real UX
+cost, mitigated by `resend-verification` for the case where the email is lost or
+delayed.
+
+---
+
+## Decision 17: Opaque, database-backed verification tokens, mirroring RefreshToken
+
+**Context:** The verification link (`GET /verify?token=...`) needs some way to prove
+"this request came from whoever received the email at registration."
+
+**Options considered:**
+- A signed, self-contained token (e.g. a short-lived JWT encoding the user id) —
+  no database lookup needed to verify it
+- An opaque random string, stored in its own `verification_tokens` table, looked up
+  by exact value
+
+**Decision:** Opaque token (`VerificationToken` entity), the same shape of decision
+already made for refresh tokens in
+[Decision 10](decisions.md#decision-10-opaque-database-backed-refresh-tokens-instead-of-a-second-jwt).
+
+**Why:** The same reasoning applies here even more directly than it did for refresh
+tokens: a verification token is inherently a **one-time-use, revocable-by-design**
+credential — the entire point is that using it once should permanently invalidate
+it (see [Decision 19](decisions.md#decision-19-one-time-tokens-delete-on-use-not-just-a-used-flag)).
+A self-contained JWT has no row to delete or flag as used — it would stay
+cryptographically valid for its full lifetime even after being consumed, which
+directly contradicts what "verify your email" is supposed to mean. An opaque,
+database-tracked token gives us a real place to enforce single-use.
+
+**Trade-off we accepted:** A database round-trip to verify — completely
+acceptable here, since this endpoint is called once per user, not per request, and
+was never a candidate for the stateless treatment JWTs get.
+
+---
+
+## Decision 18: Verification tokens expire
+
+**Context:** `VerificationToken.expiresAt` gives every token a deadline
+(`verification.token-expiration`, 24 hours) — `verifyEmail()` rejects an otherwise
+valid, unused token once that deadline passes.
+
+**Options considered:**
+- No expiry: a verification link works forever, however long it sits unused
+- A fixed expiry window, after which the token is worthless and a new one must be
+  requested via `resend-verification`
+
+**Decision:** 24-hour expiry, enforced in `EmailVerificationService.verifyEmail()`.
+
+**Why:** An email inbox is not a secure vault — links sit in inboxes, get forwarded,
+get indexed by mail-provider link scanners, and remain valid for as long as the
+token behind them does. An unbounded verification link is a permanent standing
+credential for "activate this specific account," discoverable by anyone who
+eventually gets access to that inbox, long after the original registration is
+irrelevant. A short, bounded window shrinks that exposure to something an attacker
+would need to catch in near-real-time, and `cleanupExpiredTokens()` exists
+specifically to sweep the debris so expired, useless rows don't pile up forever.
+
+**Trade-off we accepted:** A user who registers and doesn't check their email
+within 24 hours has to explicitly request a new link via `resend-verification`
+rather than the original one still working — a minor friction cost for a real
+reduction in how long a leaked link stays dangerous.
+
+---
+
+## Decision 19: One-time tokens — delete on use, not just a `used` flag
+
+**Context:** `VerificationToken` has both a `used` boolean *and* gets deleted from
+the table the moment `verifyEmail()` succeeds — Step 5's flow explicitly lists
+"Mark Used" and "Delete Token" as two separate steps, which looks redundant at
+first glance (why flag something you're about to delete anyway?).
+
+**Options considered:**
+- Delete only: remove the row immediately on successful verification, skip the
+  `used` flag entirely
+- Flag only: keep the row forever, marked `used = true`, and check that flag on
+  every verification attempt
+- Both: check `used` as a guard *before* activating the account, then delete the
+  row as cleanup in the same transaction
+
+**Decision:** Both, in that order — check `used` (and `expiresAt`) first, only then
+activate the user and delete the token.
+
+**Why:** The `used` check is what actually prevents replay — if a verification link
+is clicked twice (a mail client prefetching links, a user double-clicking, a link
+scanner following it before the real user does), the second attempt must fail
+*before* re-running "activate the account" a second time, not rely on the row
+already being gone as its only defense. Deleting afterward is what keeps
+`verification_tokens` from accumulating a permanent record of every link ever
+issued — once a token is spent, there's no future reason to keep it around, unlike
+`RefreshToken`'s soft-revoke (Decision 11), which deliberately keeps an audit trail
+of the rotation chain for investigating compromised accounts. A verification token
+has no equivalent forensic value once used.
+
+**Trade-off we accepted:** None of real consequence — the extra `UPDATE` before the
+`DELETE` is negligible cost inside a single transaction, for a real correctness
+guarantee against double-processing.

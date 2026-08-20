@@ -10,40 +10,41 @@ import com.authplatform.auth.exception.InvalidRefreshTokenException;
 import com.authplatform.auth.repository.RefreshTokenRepository;
 import com.authplatform.auth.repository.UserRepository;
 import com.authplatform.auth.security.JwtService;
+import com.authplatform.auth.security.OpaqueTokenGenerator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.security.SecureRandom;
 import java.time.Instant;
-import java.util.Base64;
 
 @Service
 public class RefreshTokenService {
 
     private static final Logger log = LoggerFactory.getLogger(RefreshTokenService.class);
-    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
     private final RefreshTokenRepository refreshTokenRepository;
     private final UserRepository userRepository;
     private final JwtService jwtService;
     private final JwtProperties jwtProperties;
     private final SessionService sessionService;
+    private final OpaqueTokenGenerator opaqueTokenGenerator;
 
     public RefreshTokenService(RefreshTokenRepository refreshTokenRepository, UserRepository userRepository,
-                                JwtService jwtService, JwtProperties jwtProperties, SessionService sessionService) {
+                                JwtService jwtService, JwtProperties jwtProperties, SessionService sessionService,
+                                OpaqueTokenGenerator opaqueTokenGenerator) {
         this.refreshTokenRepository = refreshTokenRepository;
         this.userRepository = userRepository;
         this.jwtService = jwtService;
         this.jwtProperties = jwtProperties;
         this.sessionService = sessionService;
+        this.opaqueTokenGenerator = opaqueTokenGenerator;
     }
 
     @Transactional
     public IssuedRefreshToken generateRefreshToken(User user, String deviceId, String ipAddress, String userAgent) {
         Instant expiresAt = Instant.now().plusSeconds(jwtProperties.refreshExpiration());
-        RefreshToken refreshToken = new RefreshToken(user.getId(), generateOpaqueToken(), expiresAt, deviceId);
+        RefreshToken refreshToken = new RefreshToken(user.getId(), opaqueTokenGenerator.generate(), expiresAt, deviceId);
         RefreshToken saved = refreshTokenRepository.save(refreshToken);
 
         Session session = sessionService.createSession(user.getId(), saved.getToken(), expiresAt, ipAddress, userAgent);
@@ -76,7 +77,7 @@ public class RefreshTokenService {
                 .orElseThrow(InvalidRefreshTokenException::new);
 
         Instant newExpiresAt = Instant.now().plusSeconds(jwtProperties.refreshExpiration());
-        RefreshToken newToken = new RefreshToken(user.getId(), generateOpaqueToken(), newExpiresAt, oldToken.getDeviceId());
+        RefreshToken newToken = new RefreshToken(user.getId(), opaqueTokenGenerator.generate(), newExpiresAt, oldToken.getDeviceId());
         refreshTokenRepository.save(newToken);
         revokeRefreshToken(oldToken);
 
@@ -105,11 +106,5 @@ public class RefreshTokenService {
                 });
         sessionService.revokeAndDeleteAllForUser(userId);
         log.info("Logout-all successful for userId={}", userId);
-    }
-
-    private String generateOpaqueToken() {
-        byte[] randomBytes = new byte[32];
-        SECURE_RANDOM.nextBytes(randomBytes);
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes);
     }
 }

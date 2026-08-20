@@ -59,7 +59,7 @@ public class User {
         this.lastName = lastName;
         this.email = email;
         this.password = password;
-        this.status = UserStatus.ACTIVE;
+        this.status = UserStatus.PENDING;
         this.emailVerified = false;
     }
 

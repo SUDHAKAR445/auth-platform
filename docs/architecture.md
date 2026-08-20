@@ -20,6 +20,7 @@ flowchart TB
             RefreshCtrl[RefreshTokenController]
             LogoutCtrl[LogoutController]
             SessionCtrl[SessionController]
+            VerifyCtrl[EmailVerificationController]
             UserCtrl[UserController]
         end
 
@@ -28,21 +29,25 @@ flowchart TB
             AuthSvc[AuthenticationService]
             RefreshSvc[RefreshTokenService]
             SessionSvc[SessionService]
+            VerifySvc[EmailVerificationService]
+            MailSvc[EmailService]
             UserSvc[UserService]
         end
 
         subgraph SecurityPkg["security/"]
             JwtSvc[JwtService]
             PwEncoder[PasswordEncoder - BCrypt]
+            TokenGen[OpaqueTokenGenerator]
         end
 
         Repo[UserRepository]
         RefreshRepo[RefreshTokenRepository]
         SessionRepo[SessionRepository]
+        VerifyRepo[VerificationTokenRepository]
         GEH[GlobalExceptionHandler]
     end
 
-    DB[("PostgreSQL<br/>auth_platform.users /<br/>refresh_tokens / sessions")]
+    DB[("PostgreSQL<br/>auth_platform.users /<br/>refresh_tokens / sessions /<br/>verification_tokens")]
 
     Client --> SecurityFilterChain
     SecurityFilterChain --> RegCtrl
@@ -50,6 +55,7 @@ flowchart TB
     SecurityFilterChain --> RefreshCtrl
     SecurityFilterChain --> LogoutCtrl
     SecurityFilterChain --> SessionCtrl
+    SecurityFilterChain --> VerifyCtrl
     SecurityFilterChain --> UserCtrl
 
     RegCtrl --> RegSvc
@@ -59,10 +65,13 @@ flowchart TB
     LogoutCtrl --> Repo
     SessionCtrl --> SessionSvc
     SessionCtrl --> Repo
+    VerifyCtrl --> VerifySvc
     UserCtrl --> UserSvc
 
     RegSvc --> PwEncoder
     RegSvc --> Repo
+    RegSvc --> VerifySvc
+    RegSvc --> MailSvc
     AuthSvc --> PwEncoder
     AuthSvc --> JwtSvc
     AuthSvc --> Repo
@@ -71,31 +80,65 @@ flowchart TB
     RefreshSvc --> Repo
     RefreshSvc --> RefreshRepo
     RefreshSvc --> SessionSvc
+    RefreshSvc --> TokenGen
     SessionSvc --> SessionRepo
+    VerifySvc --> Repo
+    VerifySvc --> VerifyRepo
+    VerifySvc --> MailSvc
+    VerifySvc --> TokenGen
     UserSvc --> Repo
 
     SecurityFilterChain -.uses.-> JwtSvc
+    SecurityFilterChain -.uses.-> SessionSvc
     Repo --> DB
     RefreshRepo --> DB
     SessionRepo --> DB
+    VerifyRepo --> DB
 
     RegCtrl -.exceptions.-> GEH
     LoginCtrl -.exceptions.-> GEH
     RefreshCtrl -.exceptions.-> GEH
     LogoutCtrl -.exceptions.-> GEH
     SessionCtrl -.exceptions.-> GEH
+    VerifyCtrl -.exceptions.-> GEH
     UserCtrl -.exceptions.-> GEH
 ```
 
 Note the one-way arrow `RefreshSvc --> SessionSvc`, not the reverse — `SessionService`
 never depends on `RefreshTokenService`. That's deliberate; see
 [decisions.md](decisions.md#decision-13-one-service-owns-both-refreshtoken-and-session-to-avoid-a-circular-dependency)
-for why the two would otherwise form a circular bean dependency.
+for why the two would otherwise form a circular bean dependency. Note also
+`SecurityFilterChain -.uses.-> SessionSvc` — every authenticated request now checks
+session state directly from the filter chain, before a request ever reaches a
+controller; see
+[decisions.md](decisions.md#decision-15-check-session-revocation-on-every-request-not-just-token-expiry).
+
+`OpaqueTokenGenerator` is shared by `RefreshTokenService` and
+`EmailVerificationService` — both needed the identical "cryptographically random,
+URL-safe string" logic, so it was extracted rather than duplicated once the second
+need appeared.
 
 **Why three services instead of one `UserService`:** registration, authentication, and
 profile lookup are different responsibilities with different reasons to change —
 splitting them keeps each class focused and testable in isolation. See
 [decisions.md](decisions.md#decision-7-split-registration-authentication-and-profile-lookup-into-separate-services).
+
+## Account lifecycle — registration through activation
+
+```mermaid
+flowchart LR
+    A[Register] --> B[Save User<br/>status=PENDING]
+    B --> C[Generate<br/>Verification Token]
+    C --> D[Send Email<br/>console-logged link, for now]
+    D --> E{User clicks link}
+    E -->|GET /verify| F[Activate User<br/>status=ACTIVE, emailVerified=true]
+    E -->|link lost / expired| G[POST /resend-verification]
+    G --> C
+```
+
+A user created by registration cannot log in (`403`, see
+[decisions.md](decisions.md#decision-16-require-email-verification-before-an-account-can-log-in))
+until they complete the right-hand path.
 
 ## Request flow — registration
 
@@ -106,6 +149,8 @@ sequenceDiagram
     participant Svc as RegistrationService
     participant Enc as PasswordEncoder
     participant Repo as UserRepository
+    participant VSvc as EmailVerificationService
+    participant Mail as EmailService
     participant DB as PostgreSQL
 
     C->>Ctrl: POST /api/v1/auth/register
@@ -116,11 +161,50 @@ sequenceDiagram
     DB-->>Repo: false
     Svc->>Enc: encode(rawPassword)
     Enc-->>Svc: bcryptHash
-    Svc->>Repo: save(user)
+    Svc->>Repo: save(user, status=PENDING)
     Repo->>DB: INSERT
-    Svc-->>Ctrl: RegisterResponse("Registration Successful")
+    Svc->>VSvc: generateVerificationToken(user)
+    VSvc->>DB: INSERT verification_tokens
+    VSvc-->>Svc: VerificationToken
+    Svc->>Mail: sendVerificationEmail(email, token)
+    Mail->>Mail: System.out.println(verification link)
+    Svc-->>Ctrl: RegisterResponse("...please verify your email...")
     Ctrl-->>C: 201 Created
 ```
+
+## Request flow — email verification
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant Ctrl as EmailVerificationController
+    participant Svc as EmailVerificationService
+    participant VRepo as VerificationTokenRepository
+    participant Repo as UserRepository
+
+    C->>Ctrl: GET /api/v1/auth/verify?token=xxxx
+    Ctrl->>Svc: verifyEmail(token)
+    Svc->>VRepo: findByToken(token)
+    alt not found, expired, or already used
+        Svc-->>Ctrl: throw InvalidVerificationTokenException
+        Ctrl-->>C: 400
+    else valid and unused
+        Svc->>Repo: activate user (emailVerified=true, status=ACTIVE)
+        Svc->>VRepo: mark used=true, then delete the token
+        Svc-->>Ctrl: done
+        Ctrl-->>C: 200 "Email verified successfully"
+    end
+```
+
+See [decisions.md](decisions.md#decision-19-one-time-tokens-delete-on-use-not-just-a-used-flag)
+for why the token is both flagged used *and* deleted, rather than just one or the
+other.
+
+`POST /api/v1/auth/resend-verification` follows the same enumeration-safe pattern as
+login (Decision 3): it always returns the same generic message, whether the email
+doesn't exist, is already verified, or genuinely gets a new token sent — the
+internal branching happens in `EmailVerificationService.resendVerification()`, but
+nothing about the outward response reveals which case occurred.
 
 ## Request flow — login
 
@@ -143,7 +227,13 @@ sequenceDiagram
         Ctrl-->>C: 401
     else found
         Svc->>Enc: matches(rawPassword, storedHash)
-        alt wrong password OR status != ACTIVE
+        alt wrong password
+            Svc-->>Ctrl: throw InvalidCredentialsException
+            Ctrl-->>C: 401
+        else password OK, but emailVerified == false
+            Svc-->>Ctrl: throw EmailNotVerifiedException
+            Ctrl-->>C: 403 "Verify Email First"
+        else password OK, but status != ACTIVE
             Svc-->>Ctrl: throw InvalidCredentialsException
             Ctrl-->>C: 401
         else valid
@@ -160,9 +250,16 @@ sequenceDiagram
     end
 ```
 
-Every failure branch above throws the *same* `InvalidCredentialsException` with the
-*same* message — see
+The wrong-password and inactive-status branches both throw the *same*
+`InvalidCredentialsException` with the *same* message — see
 [decisions.md](decisions.md#decision-3-one-generic-error-for-every-login-failure).
+The email-not-verified branch is the **one deliberate exception** to that rule: it
+throws a distinct `EmailNotVerifiedException` with a specific, actionable message.
+This does technically confirm the email is registered (a minor enumeration signal
+Decision 3 was designed to avoid) — accepted because "go check your email" is
+near-universal, low-risk UX across real-world auth systems, and the alternative
+(a confused user with no idea why login just silently fails) is worse. See
+[decisions.md](decisions.md#decision-16-require-email-verification-before-an-account-can-log-in).
 
 ## Request flow — refresh token rotation
 
@@ -241,25 +338,41 @@ sequenceDiagram
     participant C as Client
     participant Filter as JwtAuthenticationFilter
     participant Jwt as JwtService
+    participant SSvc as SessionService
     participant SCH as SecurityContextHolder
     participant Ctrl as UserController
 
     C->>Filter: GET /api/v1/users/1<br/>Authorization: Bearer <token>
     Filter->>Filter: extract token from header
     Filter->>Jwt: validateToken(token)
-    alt invalid / expired / missing
+    alt invalid / expired / missing signature
         Jwt-->>Filter: false
         Filter->>Ctrl: continue filter chain, no auth set
         Ctrl-->>C: 401 (rejected by authorizeHttpRequests)
-    else valid
+    else signature + expiry OK
         Jwt-->>Filter: true
-        Filter->>Jwt: extractUsername(token)
-        Jwt-->>Filter: email
-        Filter->>SCH: setAuthentication(email, authorities=[])
-        Filter->>Ctrl: continue filter chain, authenticated
-        Ctrl-->>C: 200 OK
+        Filter->>Jwt: extractSessionId(token)
+        Jwt-->>Filter: sid claim
+        Filter->>SSvc: isSessionActive(sessionId)
+        alt session revoked or expired
+            SSvc-->>Filter: false
+            Filter->>Ctrl: continue filter chain, no auth set
+            Ctrl-->>C: 401 (rejected by authorizeHttpRequests)
+        else session active
+            SSvc-->>Filter: true
+            Filter->>Jwt: extractUsername(token)
+            Jwt-->>Filter: email
+            Filter->>SCH: setAuthentication(email, authorities=[])
+            Filter->>Ctrl: continue filter chain, authenticated
+            Ctrl-->>C: 200 OK
+        end
     end
 ```
+
+This is the mechanism behind Decision 15 — a token can pass signature and expiry
+checks perfectly and *still* get rejected if its session was revoked (logout,
+logout-all) since it was issued. It's why every authenticated request now costs one
+extra Postgres query before reaching a controller.
 
 **Route rules** (`SecurityConfig`):
 
@@ -270,6 +383,8 @@ sequenceDiagram
 | `POST /api/v1/auth/refresh` | public (the caller has no valid access token by definition) |
 | `POST /api/v1/auth/logout` | public (a valid refresh token is sufficient proof of intent) |
 | `POST /api/v1/auth/logout-all` | requires a valid JWT — see [decisions.md](decisions.md#decision-14-logout-is-public-logout-all-requires-a-valid-access-token) |
+| `GET /api/v1/auth/verify` | public (the caller isn't logged in yet by definition) |
+| `POST /api/v1/auth/resend-verification` | public |
 | `GET /api/v1/sessions` | requires a valid JWT |
 | `/swagger-ui/**`, `/v3/api-docs/**` | public (dev tooling only) |
 | everything else | requires a valid JWT |

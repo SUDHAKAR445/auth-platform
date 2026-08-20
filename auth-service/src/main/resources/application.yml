@@ -22,3 +22,6 @@ jwt:
   secret: development-only-secret-please-move-to-env-var-before-prod-1234567890
   expiration: 900 # access token, seconds (15 minutes)
   refresh-expiration: 604800 # refresh token, seconds (7 days)
+
+verification:
+  token-expiration: 86400 # email verification link, seconds (24 hours)
