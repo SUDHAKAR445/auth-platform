@@ -573,3 +573,170 @@ has no equivalent forensic value once used.
 **Trade-off we accepted:** None of real consequence — the extra `UPDATE` before the
 `DELETE` is negligible cost inside a single transaction, for a real correctness
 guarantee against double-processing.
+
+---
+
+## Decision 20: Password reset tokens expire in 1 hour, not 24
+
+**Context:** `PasswordResetProperties.tokenExpiration` gives reset links a much
+shorter life than verification links (`VerificationProperties`, 24 hours).
+
+**Options considered:**
+- The same 24-hour window as email verification, for consistency
+- A shorter, separate window specifically for password reset
+
+**Decision:** 1 hour.
+
+**Why:** The two links grant very different capabilities. A verification link only
+ever does one thing — flips a boolean and a status enum — for an account that
+isn't usable yet anyway. A password reset link, if intercepted, hands over the
+password itself: full account takeover, on an account that's *already active* and
+potentially in daily use. The two shouldn't share a risk budget just because they're
+both "click a link in an email" — the reset link's blast radius is strictly larger,
+so its exposure window is strictly shorter.
+
+**Trade-off we accepted:** A user who doesn't check their inbox within an hour has
+to restart the flow via `forgot-password` again — more friction than the 24-hour
+verification window, in exchange for a shorter standing window during which a
+leaked or intercepted reset link is actually dangerous.
+
+---
+
+## Decision 21: One-time reset tokens
+
+**Context:** Same question as [Decision 19](decisions.md#decision-19-one-time-tokens-delete-on-use-not-just-a-used-flag)
+for verification tokens, asked again for password reset: should a reset token stay
+valid for repeated use within its expiry window, or die the instant it's used once?
+
+**Options considered:**
+- Reusable within the expiry window: the same link works every time until it
+  expires
+- One-time: `used` is checked before the password change happens, and the token can
+  never succeed again afterward — but this time the row is *kept* (not deleted),
+  with `usedAt` recorded
+
+**Decision:** One-time, and — unlike verification tokens — the spent row is kept
+rather than deleted.
+
+**Why the one-time part:** identical reasoning to Decision 19 — replay protection.
+A reset link sitting in an inbox or forwarded somewhere shouldn't be a standing
+"change this password whenever" credential; it should work exactly once, for the
+one reset it was issued for. **Why keep the row instead of deleting it, unlike
+verification tokens:** a spent password-reset token *does* have forensic value a
+spent verification token doesn't — `usedAt` becomes a timestamped record of exactly
+when a password was changed via this path, which matters if an account compromise
+is being investigated later. Deleting it would throw that away for no benefit.
+
+**Trade-off we accepted:** `password_reset_tokens` accumulates rows forever (no
+delete, no scheduled cleanup was requested for this table specifically) — a
+deliberate accept-and-revisit, not an oversight; the same `cleanupExpiredTokens()`-style
+sweep built for verification tokens could be extended here if the table's size
+ever becomes a real concern.
+
+---
+
+## Decision 22: The raw reset token is never stored — only its hash
+
+**Context:** `RefreshToken` and `VerificationToken` both store the raw, usable
+token value directly and look it up by exact string match. `PasswordResetToken`
+stores `tokenHash` instead — a SHA-256 digest — and the raw value only ever exists
+in memory long enough to email it once.
+
+**Options considered:**
+- Store the raw token directly, exactly like the other two token types
+- Store only a one-way hash of it; the raw value is generated, emailed, and then
+  forgotten by the application entirely
+
+**Decision:** Hash-only storage (`OpaqueTokenGenerator.hash()`, SHA-256).
+
+**Why:** This is the one token in the system that, if the database itself were ever
+read by an attacker (a SQL injection, a backup leak, an insider), would otherwise
+hand over a live, working "reset anyone's password" credential for every
+outstanding request — worse than leaking a refresh token, because a refresh token
+only extends an *already-authenticated* session, while a reset token creates a new
+authenticated state from nothing. Hashing the stored value means a database leak
+alone is no longer enough to use these tokens — the attacker would need the raw
+value, which only ever left the server once, inside the outbound email. On
+`reset-password`, we hash the *incoming* raw token with the same function and
+compare hashes — SHA-256 is deterministic, so this is a plain lookup, not a
+BCrypt-style per-attempt comparison (BCrypt's random salt would make this
+lookup-by-hash approach impossible; that's why password hashing and token hashing
+use deliberately different algorithms — see
+[Decision 2](decisions.md#decision-2-bcrypt-for-password-hashing)).
+
+**Trade-off we accepted:** None, really — hashing before storage costs a few
+microseconds and adds real defense-in-depth for the single highest-value token
+type in the system. The only reason `RefreshToken`/`VerificationToken` don't do the
+same is that neither is quite this sensitive on its own (each still requires a
+separately-valid access token or a separate email-ownership check), but this is
+arguably the strongest default going forward for any *new* token type, not a
+one-off.
+
+---
+
+## Decision 23: Resetting a password revokes every existing session
+
+**Context:** After `reset-password` succeeds, all of that user's existing sessions
+and refresh tokens could either be left alone (they were valid before, and the
+account holder presumably still controls at least the device they're resetting
+from) or revoked entirely.
+
+**Options considered:**
+- Leave existing sessions alone — only future logins get the new password
+  requirement
+- Revoke everything — `RefreshTokenService.logoutAll(userId)`, the identical
+  mechanism behind `POST /api/v1/auth/logout-all`
+
+**Decision:** Revoke everything, every time, unconditionally.
+
+**Why:** The most common real-world reason someone resets a password is that they
+suspect (or know) the old one is compromised. If an attacker is *already* logged in
+with a stolen password when the real owner resets it, leaving that attacker's
+session alive would make the reset pointless — they'd keep full access right up
+until their access token happened to expire on its own (up to 15 minutes, or
+instantly once [Decision 15](decisions.md#decision-15-check-session-revocation-on-every-request-not-just-token-expiry)'s
+check catches it on their next request, but only once we revoke — not automatically
+just because the password changed). Forcing every device to log in again with the
+new password is the only way a reset actually closes the door.
+
+**Trade-off we accepted:** The legitimate user *also* gets logged out of every
+device they were using, including the one they just used to complete the reset —
+mildly inconvenient, but the alternative (silently leaving a possibly-attacker
+session alive) is a real security hole, not a minor UX cost.
+
+---
+
+## Decision 24: User enumeration prevention as one consistent pattern, not four separate ones
+
+**Context:** `forgot-password` is now the fourth endpoint in this codebase facing
+the same underlying question: does responding differently for "account exists" vs
+"account doesn't exist" leak information worth protecting? (The other three: login
+— [Decision 3](decisions.md#decision-3-one-generic-error-for-every-login-failure);
+`resend-verification`; and now `forgot-password`.)
+
+**Options considered:**
+- Decide enumeration-safety independently, endpoint by endpoint, as each one got
+  built
+- Treat it as one standing rule applied consistently everywhere a request is keyed
+  off an email address the caller doesn't yet own
+
+**Decision:** One rule, applied the same way every time: whenever an endpoint takes
+an email address from an unauthenticated caller, the response is identical
+regardless of whether that email is registered, verified, or has a pending request
+already — `login`, `resend-verification`, and now `forgot-password` all do this.
+
+**Why:** These three endpoints are really the same shape of problem wearing
+different clothes — "prove you receive mail at this address before I tell you
+anything about the account behind it." Solving it once, as a standing pattern
+(silent no-op internally, identical success response externally, checked
+consistently at the controller boundary) means every *new* endpoint that takes an
+email address inherits the right default just by following the existing examples,
+instead of each one needing its own from-scratch security review to notice the
+enumeration risk exists at all.
+
+**Trade-off we accepted:** Debugging "why didn't I get my reset email" is
+genuinely harder from the outside — the API will never confirm whether the email
+you typed was even registered. That's the intended cost: the instant the response
+tells a caller "no account with that email," it also tells a *different* caller
+"yes, this email is registered," and there's no way to give one answer without
+giving the other.

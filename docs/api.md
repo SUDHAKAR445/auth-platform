@@ -275,6 +275,80 @@ still gets a `400` for the field validation itself.
 
 ---
 
+## `POST /api/v1/auth/forgot-password`
+
+Requests a password reset link for an account. Public.
+
+**Request**
+
+```json
+{ "email": "user@gmail.com" }
+```
+
+| Field | Rules |
+|---|---|
+| `email` | required, valid email format |
+
+**Success response — `200 OK`**, always the same regardless of what actually happened:
+
+```json
+{ "message": "If an account exists, a password reset link has been sent." }
+```
+
+Identical whether the email exists or not — same enumeration-prevention reasoning
+as login and resend-verification (see
+[decisions.md](decisions.md#decision-24-user-enumeration-prevention-as-one-consistent-pattern-not-four-separate-ones)).
+If the account exists, any previously-issued, still-unused reset token for that
+user is invalidated before the new one is created — only the most recent reset
+link ever works.
+
+**Error responses**
+
+| Status | Cause | Body |
+|---|---|---|
+| `400` | missing/blank or malformed `email` | `ErrorResponse` with `fieldErrors` |
+
+---
+
+## `POST /api/v1/auth/reset-password`
+
+Completes a password reset using the token from the emailed link. Public.
+
+**Request**
+
+```json
+{
+  "token": "raw-reset-token-from-the-email-link",
+  "newPassword": "NewPassword@123"
+}
+```
+
+| Field | Rules |
+|---|---|
+| `token` | required |
+| `newPassword` | required, ≤ 255 chars, and must satisfy the same `@StrongPassword` rules as registration: ≥ 8 chars, one uppercase, one lowercase, one digit, one special character |
+
+**Success response — `200 OK`**
+
+```json
+{ "message": "Password reset successful. Please log in again." }
+```
+
+Two side effects beyond the password change itself:
+- The reset token is marked used and can never be used again, even if it hasn't
+  expired (see [decisions.md](decisions.md#decision-21-one-time-reset-tokens)).
+- **Every** refresh token and session for the user is revoked — the same mechanism
+  as `POST /api/v1/auth/logout-all` — forcing a fresh login everywhere (see
+  [decisions.md](decisions.md#decision-23-resetting-a-password-revokes-every-existing-session)).
+
+**Error responses**
+
+| Status | Cause | Body |
+|---|---|---|
+| `400` | validation failure on `newPassword`, OR token not found/already used/expired (1-hour window) | `ErrorResponse`, message either the field errors or `Invalid or expired reset token` |
+
+---
+
 ## `GET /api/v1/sessions`
 
 Lists the authenticated user's active (non-revoked, non-expired) sessions —
@@ -336,10 +410,10 @@ Never includes the password hash.
 
 | Code | Meaning here |
 |---|---|
-| `200` | login succeeded / user found / active sessions listed |
+| `200` | login succeeded / user found / active sessions listed / forgot-password or reset-password accepted |
 | `201` | user registered |
 | `204` | logout / logout-all succeeded (no body to return) |
-| `400` | request body failed Bean Validation, or an invalid/expired/used verification token |
+| `400` | request body failed Bean Validation, or an invalid/expired/used verification or password-reset token |
 | `401` | missing/invalid JWT, invalid login credentials, invalid/expired/revoked refresh token, or a valid-but-revoked session (see [decisions.md](decisions.md#decision-15-check-session-revocation-on-every-request-not-just-token-expiry)) |
 | `403` | login attempted before email verification |
 | `404` | user id doesn't exist |

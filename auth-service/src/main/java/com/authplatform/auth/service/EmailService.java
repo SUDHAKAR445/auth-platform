@@ -14,4 +14,15 @@ public class EmailService {
         System.out.println("Link: " + verificationLink);
         System.out.println("===========================");
     }
+
+    // the raw token is emailed here and never persisted — see decisions.md #22
+    public void sendPasswordResetEmail(String toEmail, String rawToken) {
+        String resetLink = "http://localhost:8081/api/v1/auth/reset-password?token=" + rawToken;
+        System.out.println("=== Password Reset Email ===");
+        System.out.println("To: " + toEmail);
+        System.out.println("Subject: Reset your password");
+        System.out.println("Link: " + resetLink);
+        System.out.println("This link expires in 1 hour and can only be used once.");
+        System.out.println("=============================");
+    }
 }

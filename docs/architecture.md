@@ -4,6 +4,47 @@
 far; `common`, `user-service`, `notification`, and `gateway` are module skeletons
 reserved for future work (see [decisions.md](decisions.md#decision-6-multi-module-maven-layout-from-day-one)).
 
+## Logical domain view
+
+This is the conceptual shape of the platform — how its *capabilities* group by
+responsibility, independent of how the Java code is physically packaged today:
+
+```mermaid
+flowchart TB
+    IP[Identity Platform]
+
+    IP --> Auth[Authentication]
+    IP --> Iden[Identity]
+    IP --> Sess[Session]
+    IP --> Notif[Notification]
+
+    Auth --> AuthLogin[Login]
+    Auth --> AuthJwt[JWT]
+    Auth --> AuthRefresh[Refresh]
+
+    Iden --> IdenReg[Register]
+    Iden --> IdenVerify[Verify Email]
+    Iden --> IdenReset[Reset Password]
+
+    Sess --> SessDevice[Device Session]
+    Sess --> SessLogout[Logout]
+    Sess --> SessLogoutAll[Logout All]
+
+    Notif --> NotifEmail[Email]
+    NotifEmail --> NotifVerifyMail[Verification]
+    NotifEmail --> NotifResetMail[Password Reset]
+```
+
+**This is a logical view, not the physical package structure.** The actual Java
+code stays organized by technical layer (`controller/`, `service/`, `repository/`,
+etc. — see the component diagram below), not by these domain folders. Repackaging
+a 40+ file codebase into `auth/identity/session/notification/` purely for
+organizational purposes, mid-feature, was judged not worth the churn each time this
+came up (JWT day, the identity-module day, and again here) — but the logical
+grouping above is real and worth documenting on its own, since it's how the
+*capabilities* actually relate to each other regardless of which folder each class
+lives in.
+
 ## Component diagram
 
 ```mermaid
@@ -21,6 +62,7 @@ flowchart TB
             LogoutCtrl[LogoutController]
             SessionCtrl[SessionController]
             VerifyCtrl[EmailVerificationController]
+            ResetCtrl[PasswordResetController]
             UserCtrl[UserController]
         end
 
@@ -30,6 +72,7 @@ flowchart TB
             RefreshSvc[RefreshTokenService]
             SessionSvc[SessionService]
             VerifySvc[EmailVerificationService]
+            ResetSvc[PasswordResetService]
             MailSvc[EmailService]
             UserSvc[UserService]
         end
@@ -44,10 +87,11 @@ flowchart TB
         RefreshRepo[RefreshTokenRepository]
         SessionRepo[SessionRepository]
         VerifyRepo[VerificationTokenRepository]
+        ResetRepo[PasswordResetTokenRepository]
         GEH[GlobalExceptionHandler]
     end
 
-    DB[("PostgreSQL<br/>auth_platform.users /<br/>refresh_tokens / sessions /<br/>verification_tokens")]
+    DB[("PostgreSQL<br/>auth_platform.users /<br/>refresh_tokens / sessions /<br/>verification_tokens / password_reset_tokens")]
 
     Client --> SecurityFilterChain
     SecurityFilterChain --> RegCtrl
@@ -56,6 +100,7 @@ flowchart TB
     SecurityFilterChain --> LogoutCtrl
     SecurityFilterChain --> SessionCtrl
     SecurityFilterChain --> VerifyCtrl
+    SecurityFilterChain --> ResetCtrl
     SecurityFilterChain --> UserCtrl
 
     RegCtrl --> RegSvc
@@ -66,6 +111,7 @@ flowchart TB
     SessionCtrl --> SessionSvc
     SessionCtrl --> Repo
     VerifyCtrl --> VerifySvc
+    ResetCtrl --> ResetSvc
     UserCtrl --> UserSvc
 
     RegSvc --> PwEncoder
@@ -86,6 +132,12 @@ flowchart TB
     VerifySvc --> VerifyRepo
     VerifySvc --> MailSvc
     VerifySvc --> TokenGen
+    ResetSvc --> Repo
+    ResetSvc --> ResetRepo
+    ResetSvc --> PwEncoder
+    ResetSvc --> MailSvc
+    ResetSvc --> TokenGen
+    ResetSvc --> RefreshSvc
     UserSvc --> Repo
 
     SecurityFilterChain -.uses.-> JwtSvc
@@ -94,6 +146,7 @@ flowchart TB
     RefreshRepo --> DB
     SessionRepo --> DB
     VerifyRepo --> DB
+    ResetRepo --> DB
 
     RegCtrl -.exceptions.-> GEH
     LoginCtrl -.exceptions.-> GEH
@@ -101,6 +154,7 @@ flowchart TB
     LogoutCtrl -.exceptions.-> GEH
     SessionCtrl -.exceptions.-> GEH
     VerifyCtrl -.exceptions.-> GEH
+    ResetCtrl -.exceptions.-> GEH
     UserCtrl -.exceptions.-> GEH
 ```
 
@@ -113,10 +167,19 @@ session state directly from the filter chain, before a request ever reaches a
 controller; see
 [decisions.md](decisions.md#decision-15-check-session-revocation-on-every-request-not-just-token-expiry).
 
-`OpaqueTokenGenerator` is shared by `RefreshTokenService` and
-`EmailVerificationService` — both needed the identical "cryptographically random,
-URL-safe string" logic, so it was extracted rather than duplicated once the second
-need appeared.
+`OpaqueTokenGenerator` is shared by `RefreshTokenService`, `EmailVerificationService`,
+and now `PasswordResetService` — all three needed the identical "cryptographically
+random, URL-safe string" logic, so it was extracted rather than duplicated. It also
+now carries a `hash()` method used only by `PasswordResetService` — see
+[decisions.md](decisions.md#decision-22-the-raw-reset-token-is-never-stored-only-its-hash)
+for why password reset tokens are hashed before storage while the other two token
+types aren't.
+
+`PasswordResetService --> RefreshSvc` is another intentional cross-service call,
+alongside the `RefreshSvc --> SessionSvc` one above: completing a password reset
+calls `RefreshTokenService.logoutAll()` to revoke every session, the same mechanism
+`POST /api/v1/auth/logout-all` uses. See
+[decisions.md](decisions.md#decision-23-resetting-a-password-revokes-every-existing-session).
 
 **Why three services instead of one `UserService`:** registration, authentication, and
 profile lookup are different responsibilities with different reasons to change —
@@ -205,6 +268,83 @@ login (Decision 3): it always returns the same generic message, whether the emai
 doesn't exist, is already verified, or genuinely gets a new token sent — the
 internal branching happens in `EmailVerificationService.resendVerification()`, but
 nothing about the outward response reveals which case occurred.
+
+## Account lifecycle — forgot password through reset
+
+```mermaid
+flowchart LR
+    A[Forgot Password] --> B[Generate Secure<br/>Random Token]
+    B --> C[Hash Token<br/>SHA-256]
+    C --> D[Store Hash]
+    D --> E[Send Raw Token<br/>by Email]
+    E --> F{User clicks link}
+    F -->|POST /reset-password| G[Reset Password]
+    G --> H[Invalidate Sessions]
+```
+
+The raw token exists only twice: once when generated, once inside the outbound
+email. Only its hash ever touches the database — see
+[decisions.md](decisions.md#decision-22-the-raw-reset-token-is-never-stored-only-its-hash).
+`H` — invalidating sessions — is not optional cleanup; it's the step that actually
+makes the reset meaningful if the account was compromised. See
+[decisions.md](decisions.md#decision-23-resetting-a-password-revokes-every-existing-session).
+
+## Request flow — forgot password and reset password
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant Ctrl as PasswordResetController
+    participant Svc as PasswordResetService
+    participant Repo as UserRepository
+    participant RRepo as PasswordResetTokenRepository
+    participant Gen as OpaqueTokenGenerator
+    participant Mail as EmailService
+    participant Enc as PasswordEncoder
+    participant RSvc as RefreshTokenService
+
+    rect rgb(40,40,40)
+    note over C,Mail: POST /api/v1/auth/forgot-password — public, always the same response
+    C->>Ctrl: POST /forgot-password {email}
+    Ctrl->>Svc: requestPasswordReset(email)
+    Svc->>Repo: findByEmail(email)
+    alt not found
+        Svc-->>Ctrl: silent no-op
+    else found
+        Svc->>RRepo: invalidateTokensByUserId(userId)
+        Svc->>Gen: generate() then hash(rawToken)
+        Svc->>RRepo: save(userId, tokenHash, expiresAt=+1h)
+        Svc->>Mail: sendPasswordResetEmail(email, rawToken)
+        Mail->>Mail: System.out.println(reset link)
+    end
+    Ctrl-->>C: 200 "If an account exists, a password reset link has been sent."
+    end
+
+    rect rgb(40,40,40)
+    note over C,RSvc: POST /api/v1/auth/reset-password — public
+    C->>Ctrl: POST /reset-password {token, newPassword}
+    Ctrl->>Svc: resetPassword(token, newPassword)
+    Svc->>Gen: hash(token)
+    Svc->>RRepo: findByTokenHash(hash)
+    alt not found, used, or expired
+        Svc-->>Ctrl: throw InvalidPasswordResetTokenException
+        Ctrl-->>C: 400
+    else valid
+        Svc->>Enc: encode(newPassword)
+        Svc->>Repo: save user with new password hash
+        Svc->>RRepo: mark used=true, usedAt=now (row kept, not deleted)
+        Svc->>RSvc: logoutAll(userId)
+        RSvc->>RSvc: revoke every RefreshToken + Session for userId
+        Svc-->>Ctrl: done
+        Ctrl-->>C: 200 "Password reset successful. Please log in again."
+    end
+    end
+```
+
+Both endpoints are public — a user requesting a reset has, by definition, no valid
+session to authenticate with. See
+[decisions.md](decisions.md#decision-24-user-enumeration-prevention-as-one-consistent-pattern-not-four-separate-ones)
+for why `forgot-password`'s response never reveals whether the email was registered.
 
 ## Request flow — login
 
@@ -385,6 +525,8 @@ extra Postgres query before reaching a controller.
 | `POST /api/v1/auth/logout-all` | requires a valid JWT — see [decisions.md](decisions.md#decision-14-logout-is-public-logout-all-requires-a-valid-access-token) |
 | `GET /api/v1/auth/verify` | public (the caller isn't logged in yet by definition) |
 | `POST /api/v1/auth/resend-verification` | public |
+| `POST /api/v1/auth/forgot-password` | public |
+| `POST /api/v1/auth/reset-password` | public |
 | `GET /api/v1/sessions` | requires a valid JWT |
 | `/swagger-ui/**`, `/v3/api-docs/**` | public (dev tooling only) |
 | everything else | requires a valid JWT |
